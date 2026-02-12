@@ -95,9 +95,9 @@ export const ModelOptimizeCommand = cmd({
     const modelName = hfModel.split("/").pop() || hfModel
     const modelNameSafe = modelName.replace(/[^a-zA-Z0-9_-]/g, "_")
 
-    // Output directory
+    // Output directory — default to /tmp to avoid polluting the working directory
     const outputDir =
-      (args.output as string) || path.resolve(`./model_opt_${modelNameSafe}`)
+      (args.output as string) || path.resolve(`/tmp/model_opt_${modelNameSafe}`)
 
     UI.println("============================================")
     UI.println("Model Optimization Pipeline")
@@ -225,6 +225,19 @@ export const ModelOptimizeCommand = cmd({
     const opencodeDir = path.join(outputDir, ".opencode")
     const agentDir = path.join(opencodeDir, "agent")
     fs.mkdirSync(agentDir, { recursive: true })
+
+    // Exclude large directories (venv, model, __pycache__) from opencode indexing
+    fs.writeFileSync(path.join(outputDir, ".gitignore"), [
+      "venv/",
+      "model/",
+      "__pycache__/",
+      "*.safetensors",
+      "*.bin",
+      "*.pt",
+      "*.gguf",
+      "*.trace.json",
+      "*.trace.json.gz",
+    ].join("\n") + "\n")
 
     // Create agent config from .md skill file
     const agentConfig = buildAgentConfig(pipelineConfig)

@@ -7,35 +7,43 @@ agent: model-opt
 
 ## Target
 - **HuggingFace Model**: $1
-- **Output Directory**: $2 (if not specified, use `./model_opt_<model_short_name>`)
+- **Output Directory**: $2 (if not specified, use `/tmp/model_opt_<model_short_name>`)
 
 ## First Steps
-1. Parse model name from `$1` (e.g., "Qwen/Qwen3-8B" → short name "Qwen3-8B")
-2. Determine output directory: `$2` if provided, else `./model_opt_<short_name>`
+1. Parse model name from `$1`
+2. Determine output directory: `$2` if provided, else `/tmp/model_opt_<short_name>` (**MUST be outside the working directory** to avoid bloating the session)
 3. Create directory structure: `model/ demo/ profile/ problems/ optimized/ report/ scripts/`
 4. Create `config.json` and `progress.json`
-5. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
+5. Create `.gitignore` in output dir to exclude large files: `venv/`, `model/`, `*.safetensors`, `*.bin`, `*.trace.json*`
+6. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
 
 ## ⚠️ CRITICAL RULES
 - **ALWAYS activate venv**: `source <output_dir>/venv/bin/activate`
 - **NEVER modify system packages** in /opt/, /usr/
 - **ALL decisions MUST be data-driven** — profile first, optimize second
 - **Update progress.json after each phase**
+- **Optimized kernels MUST use @triton.jit** — torch rewrites are FORBIDDEN
+- **Serving benchmarks MUST use `vllm bench serve --save-result`** — hand-written JSON is FORBIDDEN
 
 ## Helper Scripts (installed at `~/.config/opencode/scripts/`)
-- `kernel_test_runner.py` — test kernel accuracy + benchmark
-- `kernel_finalize.py` — save best optimization result
-- `shape_capture.py` — capture dynamic shapes during inference
-- `analyze_fusion.py` — detect operator fusion opportunities
-- `vllm_trace_extractor.py` — extract GPU kernels from torch profiler trace
-- `vllm_benchmark.py` — orchestrate vllm serve + bench serve
-- `generate_vllm_plugin.py` — generate vLLM CustomOp plugin from optimized kernels
-
 Copy them to the project at start:
 ```bash
 SCRIPTS_SRC="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/scripts"
 cp "$SCRIPTS_SRC"/*.py <output_dir>/scripts/
 ```
+
+## ⛔ MANDATORY VALIDATION
+After Phase 6 (kernels) and Phase 7 (serving), run:
+```bash
+python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase kernels
+python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase serving
+python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase all
+```
+**If validation fails, fix the issues before proceeding.** The script checks:
+- All `*_opt.py` contain `@triton.jit` (not torch rewrites)
+- `*_serving.json` files are from real `vllm bench serve` (has standard fields)
+- Hardware info matches actual GPU
+- Baseline and optimized are separate runs (different dates)
 
 ---
 
@@ -922,11 +930,19 @@ Outputs generated with fixed random seed for verification.
 ## Execute phases in order: 0 → 1 → 4 → 5 → 6 → 7 → 8
 (Phases 2 and 3 are handled by vLLM automatically)
 
+## ⛔ MANDATORY: Run validation after Phase 6 and Phase 7
+```bash
+python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase kernels  # After Phase 6
+python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase serving   # After Phase 7
+python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase all       # Final check
+```
+
 ## General Rules
 1. **Update progress.json after each phase**
 2. **If a phase fails, debug and fix before proceeding**
-3. **Use kernel_test_runner.py for kernel testing** (no external `opencode` command needed)
+3. **Use kernel_test_runner.py for kernel testing** (no external opencode command needed)
 4. **NEVER modify system libraries — only use project venv**
 5. **Phase 7 MUST have real measured data — no estimates**
+6. **ALL *_opt.py MUST use @triton.jit** — torch rewrites will be rejected by validation
 
 Begin with Phase 0: Environment Setup.
