@@ -74,9 +74,12 @@ Use existing `baseline_serving.json` from Phase 4, or re-run:
 ```bash
 source {{OUTPUT_DIR}}/venv/bin/activate
 
-vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &
+# ALL vLLM output to log files — NEVER to stdout
+vllm serve {{HF_MODEL}} --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &> {{OUTPUT_DIR}}/vllm_baseline_e2e.log &
 VLLM_PID=$!
-timeout 300 bash -c 'until curl -s http://localhost:8192/health >/dev/null 2>&1; do sleep 5; done'
+echo "Baseline PID: $VLLM_PID"
+for i in $(seq 1 60); do curl -s http://localhost:8192/health > /dev/null 2>&1 && break; sleep 5; done
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Ready" || { echo "✗ Failed"; tail -3 {{OUTPUT_DIR}}/vllm_baseline_e2e.log; }
 
 vllm bench serve \
   --model {{HF_MODEL}} --port 8192 \
@@ -84,9 +87,19 @@ vllm bench serve \
   --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{CONCURRENCY}} \
   --request-rate inf --save-result \
-  --result-dir {{REPORT_DIR}} --result-filename baseline_serving.json --label baseline
+  --result-dir {{REPORT_DIR}} --result-filename baseline_serving.json --label baseline \
+  &> {{REPORT_DIR}}/bench_baseline.log
 
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
+
+# Show only key metrics
+python3 -c "
+import json
+with open('{{REPORT_DIR}}/baseline_serving.json') as f: d=json.load(f)
+print('=== Baseline ===')
+for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
+"
 ```
 
 ## Step 4: ⛔ MANDATORY — Start Patched vLLM and Benchmark
@@ -94,42 +107,51 @@ kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```bash
 source {{OUTPUT_DIR}}/venv/bin/activate
 
-# Start vLLM with CustomOp plugin
+# Start patched vLLM — ALL output to log file
 python3 {{OPTIMIZED_DIR}}/run_patched_vllm.py serve \
   --model {{HF_MODEL}} --dtype auto --max-model-len 4096 \
-  --port 8193 --disable-log-requests &
+  --port 8193 --disable-log-requests &> {{OUTPUT_DIR}}/vllm_patched.log &
 PATCHED_PID=$!
+echo "Patched PID: $PATCHED_PID (log: {{OUTPUT_DIR}}/vllm_patched.log)"
 
-# Wait for server to be ready
-echo "Waiting for patched vLLM..."
-timeout 300 bash -c 'until curl -s http://localhost:8193/health >/dev/null 2>&1; do sleep 5; done'
-echo "Patched server ready!"
+# Wait silently
+for i in $(seq 1 60); do curl -s http://localhost:8193/health > /dev/null 2>&1 && break; sleep 5; done
+curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "✓ Patched server ready" || { echo "✗ Failed"; tail -5 {{OUTPUT_DIR}}/vllm_patched.log; }
 
-# Verify the correct model is loaded
+# Verify correct model (compact output)
 curl -s http://localhost:8193/v1/models | python3 -c "
-import json,sys
-data=json.load(sys.stdin)
-models=[m['id'] for m in data.get('data',[])]
+import json,sys; d=json.load(sys.stdin)
+models=[m['id'] for m in d.get('data',[])]
 print(f'Models: {models}')
-assert '{{HF_MODEL}}' in models, f'Expected {{HF_MODEL}} but got {models}'
-print('✓ Correct model loaded')
+assert '{{HF_MODEL}}' in models, f'Wrong model!'
 "
 
-# Quick correctness test — verify server responds
+# Quick correctness test
 curl -s http://localhost:8193/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"{{HF_MODEL}}","prompt":"Hello","max_tokens":5}' | python3 -m json.tool
+  -d '{"model":"{{HF_MODEL}}","prompt":"Hello","max_tokens":5}' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('✓ OK' if 'choices' in d else f'✗ {d}')"
 
-# Run benchmark (SAME parameters as baseline)
+# Benchmark — output to file
 vllm bench serve \
   --model {{HF_MODEL}} --port 8193 \
   --dataset-name random \
   --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{CONCURRENCY}} \
   --request-rate inf --save-result \
-  --result-dir {{REPORT_DIR}} --result-filename optimized_serving.json --label optimized
+  --result-dir {{REPORT_DIR}} --result-filename optimized_serving.json --label optimized \
+  &> {{REPORT_DIR}}/bench_optimized.log
 
 kill $PATCHED_PID 2>/dev/null; wait $PATCHED_PID 2>/dev/null
+
+# Show only key metrics
+python3 -c "
+import json
+with open('{{REPORT_DIR}}/optimized_serving.json') as f: d=json.load(f)
+print('=== Optimized ===')
+for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
+"
 ```
 
 **If the patched server fails to start or crashes:**

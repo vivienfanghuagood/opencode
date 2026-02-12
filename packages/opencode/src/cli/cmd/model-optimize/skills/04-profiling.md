@@ -3,65 +3,51 @@
 ## Goal
 Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis.
 
-## ⚠️ CORRECT Profiling Approach for vLLM
-
-**DO NOT** use `rocprof` or single-request profiling.
-**DO** use `vllm bench serve` with realistic concurrency to capture production-like behavior.
-
-The profiling has TWO parts:
-1. **Throughput benchmark**: Measure baseline ITPS/OTPS/TPOT/TTFT at target concurrency
-2. **Kernel trace**: Collect torch profiler trace via `VLLM_TORCH_PROFILER_DIR` for kernel analysis
+## ⚠️ CRITICAL: ALL vLLM output MUST go to log files
+**NEVER let vLLM stdout/stderr appear in bash output.** Always use `&> logfile`.
+**For `vllm bench serve`, redirect to file and only extract key metrics.**
 
 ## Step 1: Baseline Throughput Benchmark
 
 ```bash
 source {{OUTPUT_DIR}}/venv/bin/activate
 
-# Start vLLM serve (baseline, no profiler)
+# Start vLLM — ALL output to log file
 vllm serve {{HF_MODEL}} \
   --dtype auto \
   --max-model-len 4096 \
   --port 8192 \
-  --disable-log-requests &
+  --disable-log-requests &> {{OUTPUT_DIR}}/vllm_baseline.log &
 VLLM_PID=$!
+echo "Baseline vLLM PID: $VLLM_PID (log: {{OUTPUT_DIR}}/vllm_baseline.log)"
 
-# Wait for server to be ready
-echo "Waiting for vLLM to be ready..."
-timeout 300 bash -c 'until curl -s http://localhost:8192/health > /dev/null 2>&1; do sleep 5; done'
-echo "Server ready!"
+# Wait silently
+for i in $(seq 1 60); do
+  curl -s http://localhost:8192/health > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Server ready" || { echo "✗ Failed — check vllm_baseline.log"; tail -5 {{OUTPUT_DIR}}/vllm_baseline.log; }
 
-# Run benchmark: 1K input / 1K output, concurrency={{CONCURRENCY}}
+# Run benchmark — output to file, then extract only key metrics
 vllm bench serve \
-  --model {{HF_MODEL}} \
-  --port 8192 \
+  --model {{HF_MODEL}} --port 8192 \
   --dataset-name random \
-  --input-len {{INPUT_LEN}} \
-  --output-len {{OUTPUT_LEN}} \
-  --num-prompts {{NUM_PROMPTS}} \
-  --max-concurrency {{CONCURRENCY}} \
-  --request-rate inf \
-  --save-result \
-  --result-dir {{PROFILE_DIR}} \
-  --result-filename baseline_benchmark.json \
-  --label baseline
+  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{CONCURRENCY}} \
+  --request-rate inf --save-result \
+  --result-dir {{PROFILE_DIR}} --result-filename baseline_benchmark.json \
+  --label baseline &> {{PROFILE_DIR}}/bench_baseline.log
 
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
-```
 
-Parse and save the key metrics:
-```bash
+# Show ONLY key metrics (not the full benchmark output)
 python3 -c "
 import json
 with open('{{PROFILE_DIR}}/baseline_benchmark.json') as f:
-    data = json.load(f)
-print('=== Baseline Throughput ===')
-for key in ['total_input_tokens', 'total_output_tokens', 'request_throughput',
-            'input_throughput', 'output_throughput',
-            'mean_ttft_ms', 'median_ttft_ms', 'p99_ttft_ms',
-            'mean_tpot_ms', 'median_tpot_ms', 'p99_tpot_ms',
-            'mean_itl_ms', 'median_itl_ms', 'p99_itl_ms']:
-    val = data.get(key, 'N/A')
-    print(f'  {key}: {val}')
+    d = json.load(f)
+print('=== Baseline Metrics ===')
+for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms','mean_itl_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
 "
 ```
 
@@ -71,40 +57,38 @@ for key in ['total_input_tokens', 'total_output_tokens', 'request_throughput',
 source {{OUTPUT_DIR}}/venv/bin/activate
 mkdir -p {{PROFILE_DIR}}/traces
 
-# Start vLLM WITH profiler enabled
+# Start vLLM WITH profiler — output to log file
 VLLM_TORCH_PROFILER_DIR={{PROFILE_DIR}}/traces \
 vllm serve {{HF_MODEL}} \
   --dtype auto \
   --max-model-len 4096 \
   --port 8193 \
-  --disable-log-requests &
+  --disable-log-requests &> {{OUTPUT_DIR}}/vllm_trace.log &
 VLLM_PID=$!
+echo "Trace vLLM PID: $VLLM_PID (log: {{OUTPUT_DIR}}/vllm_trace.log)"
 
-echo "Waiting for vLLM (profiler) to be ready..."
-timeout 300 bash -c 'until curl -s http://localhost:8193/health > /dev/null 2>&1; do sleep 5; done'
+# Wait silently
+for i in $(seq 1 60); do
+  curl -s http://localhost:8193/health > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "✓ Trace server ready" || { echo "✗ Failed"; tail -5 {{OUTPUT_DIR}}/vllm_trace.log; }
 
-# Send requests for trace collection (fewer prompts, same concurrency)
+# Send requests for trace — output to file
 vllm bench serve \
-  --model {{HF_MODEL}} \
-  --port 8193 \
+  --model {{HF_MODEL}} --port 8193 \
   --dataset-name random \
-  --input-len {{INPUT_LEN}} \
-  --output-len {{OUTPUT_LEN}} \
-  --num-prompts 30 \
-  --max-concurrency {{CONCURRENCY}} \
-  --request-rate inf \
-  --save-result \
-  --result-dir {{PROFILE_DIR}} \
-  --result-filename trace_benchmark.json \
-  --label trace
+  --input-len {{INPUT_LEN}} --output-len {{OUTPUT_LEN}} \
+  --num-prompts 30 --max-concurrency {{CONCURRENCY}} \
+  --request-rate inf --save-result \
+  --result-dir {{PROFILE_DIR}} --result-filename trace_benchmark.json \
+  --label trace &> {{PROFILE_DIR}}/bench_trace.log
 
-# Wait for profiler to flush
 sleep 15
-
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
 echo "Trace files:"
-ls -lh {{PROFILE_DIR}}/traces/
+ls -lh {{PROFILE_DIR}}/traces/ 2>/dev/null | head -5
 ```
 
 ## Step 3: Extract Kernel Bottlenecks from Trace
@@ -113,7 +97,6 @@ ls -lh {{PROFILE_DIR}}/traces/
 cd {{PROFILE_DIR}}
 cp {{OUTPUT_DIR}}/scripts/vllm_trace_extractor.py .
 
-# Find latest trace file
 TRACE_FILE=$(ls -t traces/*.json traces/*.json.gz 2>/dev/null | head -1)
 echo "Analyzing: $TRACE_FILE"
 
@@ -151,28 +134,27 @@ for k in kernels[:30]:
     elif 'attn' in name.lower() or 'flash' in name.lower() or 'mha' in name.lower():
         reason = 'Attention'; optimizable = True
     elif 'norm' in name.lower() or 'rms' in name.lower():
-        reason = 'Normalization - Triton fusable'; optimizable = True
+        reason = 'Normalization'; optimizable = True
     elif 'elementwise' in name.lower() or 'vectorized' in name.lower():
-        reason = 'Elementwise - Triton fusable'; optimizable = True
-    elif 'silu' in name.lower() or 'gelu' in name.lower() or 'act' in name.lower():
-        reason = 'Activation - fusable'; optimizable = True
-    elif 'rope' in name.lower() or 'rotary' in name.lower():
-        reason = 'RoPE - Triton fusable'; optimizable = True
+        reason = 'Elementwise'; optimizable = True
+    elif 'silu' in name.lower() or 'gelu' in name.lower():
+        reason = 'Activation'; optimizable = True
     elif 'copy' in name.lower() or 'Cat' in name:
         reason = 'Memory op'; optimizable = False
     bottlenecks.append({**k, 'cuda_time_percent': pct, 'optimizable': optimizable, 'reason': reason})
 
-print(f'Total GPU time: {total/1000:.2f}ms')
-for i, b in enumerate(bottlenecks[:15], 1):
-    opt = '✓' if b['optimizable'] else '✗'
-    print(f\"{i:2d}. {b['name'][:50]:50s} {b['cuda_time_percent']:5.1f}% ({b['total_dur_us']/1000:.2f}ms) x{b['count']} {opt} {b['reason']}\")
+# Print compact summary (not full data)
+print(f'Total GPU time: {total/1000:.2f}ms, Top 10 kernels:')
+for i, b in enumerate(bottlenecks[:10], 1):
+    print(f\"  {i}. {b['name'][:45]:45s} {b['cuda_time_percent']:5.1f}%\")
 
 with open('bottlenecks.json', 'w') as f:
     json.dump(bottlenecks, f, indent=2)
+print(f'Saved bottlenecks.json ({len(bottlenecks)} kernels)')
 "
 ```
 
-## Step 5: Save model shapes for problem file generation
+## Step 5: Save model shapes
 
 ```bash
 source {{OUTPUT_DIR}}/venv/bin/activate

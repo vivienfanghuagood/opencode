@@ -11,39 +11,22 @@ agent: model-opt
 
 ## First Steps
 1. Parse model name from `$1`
-2. Determine output directory: `$2` if provided, else `/tmp/model_opt_<short_name>` (**MUST be outside the working directory** to avoid bloating the session)
-3. Create directory structure: `model/ demo/ profile/ problems/ optimized/ report/ scripts/`
-4. Create `config.json` and `progress.json`
-5. Create `.gitignore` in output dir to exclude large files: `venv/`, `model/`, `*.safetensors`, `*.bin`, `*.trace.json*`
-6. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
+2. Determine output directory: `$2` if provided, else `/tmp/model_opt_<short_name>` (**MUST be outside the working directory**)
+3. Create directory structure + `.gitignore` (exclude venv/, model/, *.safetensors, etc.)
+4. Copy helper scripts from `~/.config/opencode/scripts/` to `<output_dir>/scripts/`
 
 ## ⚠️ CRITICAL RULES
 - **ALWAYS activate venv**: `source <output_dir>/venv/bin/activate`
-- **NEVER modify system packages** in /opt/, /usr/
-- **ALL decisions MUST be data-driven** — profile first, optimize second
-- **Update progress.json after each phase**
+- **ALL vLLM commands MUST redirect output to log files** (`&> logfile`) — NEVER dump vLLM logs into bash output
+- **ALL decisions MUST be data-driven**
 - **Optimized kernels MUST use @triton.jit** — torch rewrites are FORBIDDEN
-- **Serving benchmarks MUST use `vllm bench serve --save-result`** — hand-written JSON is FORBIDDEN
-
-## Helper Scripts (installed at `~/.config/opencode/scripts/`)
-Copy them to the project at start:
-```bash
-SCRIPTS_SRC="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/scripts"
-cp "$SCRIPTS_SRC"/*.py <output_dir>/scripts/
-```
+- **Serving benchmarks MUST use `vllm bench serve --save-result`**
 
 ## ⛔ MANDATORY VALIDATION
-After Phase 6 (kernels) and Phase 7 (serving), run:
+After Phase 6 and Phase 7, run:
 ```bash
-python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase kernels
-python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase serving
 python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase all
 ```
-**If validation fails, fix the issues before proceeding.** The script checks:
-- All `*_opt.py` contain `@triton.jit` (not torch rewrites)
-- `*_serving.json` files are from real `vllm bench serve` (has standard fields)
-- Hardware info matches actual GPU
-- Baseline and optimized are separate runs (different dates)
 
 ---
 
@@ -117,31 +100,39 @@ In vLLM mode, there is NO need to:
 - Write a demo inference script
 - Fix compatibility issues manually
 
+## ⚠️ CRITICAL: Never dump vLLM logs into bash output
+**ALL vLLM commands MUST redirect output to log files.** vLLM logs are thousands of lines and will break the session context.
+
 ## Steps
 
 ### 1. Test vLLM serve
 ```bash
 source <output_dir>/venv/bin/activate
 
-# Quick test: start vllm serve and send a test request
-# Adjust --tensor-parallel-size based on model size and GPU count
+# Start vLLM — ALL output to log file, NEVER to stdout
 vllm serve $1 \
   --dtype auto \
   --max-model-len 2048 \
   --port 8192 \
-  --disable-log-requests &
-
+  --disable-log-requests &> <output_dir>/vllm_serve.log &
 VLLM_PID=$!
-sleep 30  # Wait for model to load
+echo "vLLM PID: $VLLM_PID"
 
-# Test with a simple request
+# Wait for server (silent polling)
+for i in $(seq 1 60); do
+  curl -s http://localhost:8192/health > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Server ready" || echo "✗ Server failed — check <output_dir>/vllm_serve.log"
+
+# Quick inference test (only show the result, not vllm internals)
 curl -s http://localhost:8192/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "$1", "prompt": "Hello, I am", "max_tokens": 20}' | python3 -m json.tool
+  -d '{"model": "$1", "prompt": "Hello, I am", "max_tokens": 20}' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('✓ Inference OK' if 'choices' in d else f'✗ Error: {d}')"
 
 # Kill the test server
-kill $VLLM_PID 2>/dev/null
-wait $VLLM_PID 2>/dev/null
+kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```
 
 ### 2. Record model config
@@ -199,65 +190,51 @@ Update progress.json if not already done.
 ## Goal
 Benchmark vLLM serving throughput AND collect GPU kernel trace for bottleneck analysis.
 
-## ⚠️ CORRECT Profiling Approach for vLLM
-
-**DO NOT** use `rocprof` or single-request profiling.
-**DO** use `vllm bench serve` with realistic concurrency to capture production-like behavior.
-
-The profiling has TWO parts:
-1. **Throughput benchmark**: Measure baseline ITPS/OTPS/TPOT/TTFT at target concurrency
-2. **Kernel trace**: Collect torch profiler trace via `VLLM_TORCH_PROFILER_DIR` for kernel analysis
+## ⚠️ CRITICAL: ALL vLLM output MUST go to log files
+**NEVER let vLLM stdout/stderr appear in bash output.** Always use `&> logfile`.
+**For `vllm bench serve`, redirect to file and only extract key metrics.**
 
 ## Step 1: Baseline Throughput Benchmark
 
 ```bash
 source <output_dir>/venv/bin/activate
 
-# Start vLLM serve (baseline, no profiler)
+# Start vLLM — ALL output to log file
 vllm serve $1 \
   --dtype auto \
   --max-model-len 4096 \
   --port 8192 \
-  --disable-log-requests &
+  --disable-log-requests &> <output_dir>/vllm_baseline.log &
 VLLM_PID=$!
+echo "Baseline vLLM PID: $VLLM_PID (log: <output_dir>/vllm_baseline.log)"
 
-# Wait for server to be ready
-echo "Waiting for vLLM to be ready..."
-timeout 300 bash -c 'until curl -s http://localhost:8192/health > /dev/null 2>&1; do sleep 5; done'
-echo "Server ready!"
+# Wait silently
+for i in $(seq 1 60); do
+  curl -s http://localhost:8192/health > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Server ready" || { echo "✗ Failed — check vllm_baseline.log"; tail -5 <output_dir>/vllm_baseline.log; }
 
-# Run benchmark: 1K input / 1K output, concurrency=16
+# Run benchmark — output to file, then extract only key metrics
 vllm bench serve \
-  --model $1 \
-  --port 8192 \
+  --model $1 --port 8192 \
   --dataset-name random \
-  --input-len 1024 \
-  --output-len 1024 \
-  --num-prompts 100 \
-  --max-concurrency 16 \
-  --request-rate inf \
-  --save-result \
-  --result-dir <output_dir>/profile \
-  --result-filename baseline_benchmark.json \
-  --label baseline
+  --input-len 1024 --output-len 1024 \
+  --num-prompts 100 --max-concurrency 16 \
+  --request-rate inf --save-result \
+  --result-dir <output_dir>/profile --result-filename baseline_benchmark.json \
+  --label baseline &> <output_dir>/profile/bench_baseline.log
 
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
-```
 
-Parse and save the key metrics:
-```bash
+# Show ONLY key metrics (not the full benchmark output)
 python3 -c "
 import json
 with open('<output_dir>/profile/baseline_benchmark.json') as f:
-    data = json.load(f)
-print('=== Baseline Throughput ===')
-for key in ['total_input_tokens', 'total_output_tokens', 'request_throughput',
-            'input_throughput', 'output_throughput',
-            'mean_ttft_ms', 'median_ttft_ms', 'p99_ttft_ms',
-            'mean_tpot_ms', 'median_tpot_ms', 'p99_tpot_ms',
-            'mean_itl_ms', 'median_itl_ms', 'p99_itl_ms']:
-    val = data.get(key, 'N/A')
-    print(f'  {key}: {val}')
+    d = json.load(f)
+print('=== Baseline Metrics ===')
+for k in ['output_throughput','request_throughput','mean_tpot_ms','mean_ttft_ms','mean_itl_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
 "
 ```
 
@@ -267,40 +244,38 @@ for key in ['total_input_tokens', 'total_output_tokens', 'request_throughput',
 source <output_dir>/venv/bin/activate
 mkdir -p <output_dir>/profile/traces
 
-# Start vLLM WITH profiler enabled
+# Start vLLM WITH profiler — output to log file
 VLLM_TORCH_PROFILER_DIR=<output_dir>/profile/traces \
 vllm serve $1 \
   --dtype auto \
   --max-model-len 4096 \
   --port 8193 \
-  --disable-log-requests &
+  --disable-log-requests &> <output_dir>/vllm_trace.log &
 VLLM_PID=$!
+echo "Trace vLLM PID: $VLLM_PID (log: <output_dir>/vllm_trace.log)"
 
-echo "Waiting for vLLM (profiler) to be ready..."
-timeout 300 bash -c 'until curl -s http://localhost:8193/health > /dev/null 2>&1; do sleep 5; done'
+# Wait silently
+for i in $(seq 1 60); do
+  curl -s http://localhost:8193/health > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "✓ Trace server ready" || { echo "✗ Failed"; tail -5 <output_dir>/vllm_trace.log; }
 
-# Send requests for trace collection (fewer prompts, same concurrency)
+# Send requests for trace — output to file
 vllm bench serve \
-  --model $1 \
-  --port 8193 \
+  --model $1 --port 8193 \
   --dataset-name random \
-  --input-len 1024 \
-  --output-len 1024 \
-  --num-prompts 30 \
-  --max-concurrency 16 \
-  --request-rate inf \
-  --save-result \
-  --result-dir <output_dir>/profile \
-  --result-filename trace_benchmark.json \
-  --label trace
+  --input-len 1024 --output-len 1024 \
+  --num-prompts 30 --max-concurrency 16 \
+  --request-rate inf --save-result \
+  --result-dir <output_dir>/profile --result-filename trace_benchmark.json \
+  --label trace &> <output_dir>/profile/bench_trace.log
 
-# Wait for profiler to flush
 sleep 15
-
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 
 echo "Trace files:"
-ls -lh <output_dir>/profile/traces/
+ls -lh <output_dir>/profile/traces/ 2>/dev/null | head -5
 ```
 
 ## Step 3: Extract Kernel Bottlenecks from Trace
@@ -309,7 +284,6 @@ ls -lh <output_dir>/profile/traces/
 cd <output_dir>/profile
 cp <output_dir>/scripts/vllm_trace_extractor.py .
 
-# Find latest trace file
 TRACE_FILE=$(ls -t traces/*.json traces/*.json.gz 2>/dev/null | head -1)
 echo "Analyzing: $TRACE_FILE"
 
@@ -347,28 +321,27 @@ for k in kernels[:30]:
     elif 'attn' in name.lower() or 'flash' in name.lower() or 'mha' in name.lower():
         reason = 'Attention'; optimizable = True
     elif 'norm' in name.lower() or 'rms' in name.lower():
-        reason = 'Normalization - Triton fusable'; optimizable = True
+        reason = 'Normalization'; optimizable = True
     elif 'elementwise' in name.lower() or 'vectorized' in name.lower():
-        reason = 'Elementwise - Triton fusable'; optimizable = True
-    elif 'silu' in name.lower() or 'gelu' in name.lower() or 'act' in name.lower():
-        reason = 'Activation - fusable'; optimizable = True
-    elif 'rope' in name.lower() or 'rotary' in name.lower():
-        reason = 'RoPE - Triton fusable'; optimizable = True
+        reason = 'Elementwise'; optimizable = True
+    elif 'silu' in name.lower() or 'gelu' in name.lower():
+        reason = 'Activation'; optimizable = True
     elif 'copy' in name.lower() or 'Cat' in name:
         reason = 'Memory op'; optimizable = False
     bottlenecks.append({**k, 'cuda_time_percent': pct, 'optimizable': optimizable, 'reason': reason})
 
-print(f'Total GPU time: {total/1000:.2f}ms')
-for i, b in enumerate(bottlenecks[:15], 1):
-    opt = '✓' if b['optimizable'] else '✗'
-    print(f\"{i:2d}. {b['name'][:50]:50s} {b['cuda_time_percent']:5.1f}% ({b['total_dur_us']/1000:.2f}ms) x{b['count']} {opt} {b['reason']}\")
+# Print compact summary (not full data)
+print(f'Total GPU time: {total/1000:.2f}ms, Top 10 kernels:')
+for i, b in enumerate(bottlenecks[:10], 1):
+    print(f\"  {i}. {b['name'][:45]:45s} {b['cuda_time_percent']:5.1f}%\")
 
 with open('bottlenecks.json', 'w') as f:
     json.dump(bottlenecks, f, indent=2)
+print(f'Saved bottlenecks.json ({len(bottlenecks)} kernels)')
 "
 ```
 
-## Step 5: Save model shapes for problem file generation
+## Step 5: Save model shapes
 
 ```bash
 source <output_dir>/venv/bin/activate
@@ -723,9 +696,12 @@ Use existing `baseline_serving.json` from Phase 4, or re-run:
 ```bash
 source <output_dir>/venv/bin/activate
 
-vllm serve $1 --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &
+# ALL vLLM output to log files — NEVER to stdout
+vllm serve $1 --dtype auto --max-model-len 4096 --port 8192 --disable-log-requests &> <output_dir>/vllm_baseline_e2e.log &
 VLLM_PID=$!
-timeout 300 bash -c 'until curl -s http://localhost:8192/health >/dev/null 2>&1; do sleep 5; done'
+echo "Baseline PID: $VLLM_PID"
+for i in $(seq 1 60); do curl -s http://localhost:8192/health > /dev/null 2>&1 && break; sleep 5; done
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Ready" || { echo "✗ Failed"; tail -3 <output_dir>/vllm_baseline_e2e.log; }
 
 vllm bench serve \
   --model $1 --port 8192 \
@@ -733,9 +709,19 @@ vllm bench serve \
   --input-len 1024 --output-len 1024 \
   --num-prompts 100 --max-concurrency 16 \
   --request-rate inf --save-result \
-  --result-dir <output_dir>/report --result-filename baseline_serving.json --label baseline
+  --result-dir <output_dir>/report --result-filename baseline_serving.json --label baseline \
+  &> <output_dir>/report/bench_baseline.log
 
 kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
+
+# Show only key metrics
+python3 -c "
+import json
+with open('<output_dir>/report/baseline_serving.json') as f: d=json.load(f)
+print('=== Baseline ===')
+for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
+"
 ```
 
 ## Step 4: ⛔ MANDATORY — Start Patched vLLM and Benchmark
@@ -743,42 +729,51 @@ kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```bash
 source <output_dir>/venv/bin/activate
 
-# Start vLLM with CustomOp plugin
+# Start patched vLLM — ALL output to log file
 python3 <output_dir>/optimized/run_patched_vllm.py serve \
   --model $1 --dtype auto --max-model-len 4096 \
-  --port 8193 --disable-log-requests &
+  --port 8193 --disable-log-requests &> <output_dir>/vllm_patched.log &
 PATCHED_PID=$!
+echo "Patched PID: $PATCHED_PID (log: <output_dir>/vllm_patched.log)"
 
-# Wait for server to be ready
-echo "Waiting for patched vLLM..."
-timeout 300 bash -c 'until curl -s http://localhost:8193/health >/dev/null 2>&1; do sleep 5; done'
-echo "Patched server ready!"
+# Wait silently
+for i in $(seq 1 60); do curl -s http://localhost:8193/health > /dev/null 2>&1 && break; sleep 5; done
+curl -s http://localhost:8193/health > /dev/null 2>&1 && echo "✓ Patched server ready" || { echo "✗ Failed"; tail -5 <output_dir>/vllm_patched.log; }
 
-# Verify the correct model is loaded
+# Verify correct model (compact output)
 curl -s http://localhost:8193/v1/models | python3 -c "
-import json,sys
-data=json.load(sys.stdin)
-models=[m['id'] for m in data.get('data',[])]
+import json,sys; d=json.load(sys.stdin)
+models=[m['id'] for m in d.get('data',[])]
 print(f'Models: {models}')
-assert '$1' in models, f'Expected $1 but got {models}'
-print('✓ Correct model loaded')
+assert '$1' in models, f'Wrong model!'
 "
 
-# Quick correctness test — verify server responds
+# Quick correctness test
 curl -s http://localhost:8193/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"$1","prompt":"Hello","max_tokens":5}' | python3 -m json.tool
+  -d '{"model":"$1","prompt":"Hello","max_tokens":5}' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('✓ OK' if 'choices' in d else f'✗ {d}')"
 
-# Run benchmark (SAME parameters as baseline)
+# Benchmark — output to file
 vllm bench serve \
   --model $1 --port 8193 \
   --dataset-name random \
   --input-len 1024 --output-len 1024 \
   --num-prompts 100 --max-concurrency 16 \
   --request-rate inf --save-result \
-  --result-dir <output_dir>/report --result-filename optimized_serving.json --label optimized
+  --result-dir <output_dir>/report --result-filename optimized_serving.json --label optimized \
+  &> <output_dir>/report/bench_optimized.log
 
 kill $PATCHED_PID 2>/dev/null; wait $PATCHED_PID 2>/dev/null
+
+# Show only key metrics
+python3 -c "
+import json
+with open('<output_dir>/report/optimized_serving.json') as f: d=json.load(f)
+print('=== Optimized ===')
+for k in ['output_throughput','mean_tpot_ms','mean_ttft_ms','completed']:
+    print(f'  {k}: {d.get(k,\"N/A\")}')
+"
 ```
 
 **If the patched server fails to start or crashes:**
@@ -926,23 +921,6 @@ Outputs generated with fixed random seed for verification.
 ---
 
 # EXECUTION INSTRUCTIONS
-
-## Execute phases in order: 0 → 1 → 4 → 5 → 6 → 7 → 8
-(Phases 2 and 3 are handled by vLLM automatically)
-
-## ⛔ MANDATORY: Run validation after Phase 6 and Phase 7
-```bash
-python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase kernels  # After Phase 6
-python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase serving   # After Phase 7
-python <output_dir>/scripts/validate_pipeline.py --project-dir <output_dir> --phase all       # Final check
-```
-
-## General Rules
-1. **Update progress.json after each phase**
-2. **If a phase fails, debug and fix before proceeding**
-3. **Use kernel_test_runner.py for kernel testing** (no external opencode command needed)
-4. **NEVER modify system libraries — only use project venv**
-5. **Phase 7 MUST have real measured data — no estimates**
-6. **ALL *_opt.py MUST use @triton.jit** — torch rewrites will be rejected by validation
-
-Begin with Phase 0: Environment Setup.
+Execute phases: 0 → 1 → 4 → 5 → 6 → 7 → 8 (Phases 2-3 handled by vLLM).
+**ALL vLLM output to log files. Run validate_pipeline.py after Phase 6 and 7.**
+Begin with Phase 0.

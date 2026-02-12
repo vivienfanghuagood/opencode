@@ -9,31 +9,39 @@ In vLLM mode, there is NO need to:
 - Write a demo inference script
 - Fix compatibility issues manually
 
+## ⚠️ CRITICAL: Never dump vLLM logs into bash output
+**ALL vLLM commands MUST redirect output to log files.** vLLM logs are thousands of lines and will break the session context.
+
 ## Steps
 
 ### 1. Test vLLM serve
 ```bash
 source {{OUTPUT_DIR}}/venv/bin/activate
 
-# Quick test: start vllm serve and send a test request
-# Adjust --tensor-parallel-size based on model size and GPU count
+# Start vLLM — ALL output to log file, NEVER to stdout
 vllm serve {{HF_MODEL}} \
   --dtype auto \
   --max-model-len 2048 \
   --port 8192 \
-  --disable-log-requests &
-
+  --disable-log-requests &> {{OUTPUT_DIR}}/vllm_serve.log &
 VLLM_PID=$!
-sleep 30  # Wait for model to load
+echo "vLLM PID: $VLLM_PID"
 
-# Test with a simple request
+# Wait for server (silent polling)
+for i in $(seq 1 60); do
+  curl -s http://localhost:8192/health > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -s http://localhost:8192/health > /dev/null 2>&1 && echo "✓ Server ready" || echo "✗ Server failed — check {{OUTPUT_DIR}}/vllm_serve.log"
+
+# Quick inference test (only show the result, not vllm internals)
 curl -s http://localhost:8192/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "{{HF_MODEL}}", "prompt": "Hello, I am", "max_tokens": 20}' | python3 -m json.tool
+  -d '{"model": "{{HF_MODEL}}", "prompt": "Hello, I am", "max_tokens": 20}' \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print('✓ Inference OK' if 'choices' in d else f'✗ Error: {d}')"
 
 # Kill the test server
-kill $VLLM_PID 2>/dev/null
-wait $VLLM_PID 2>/dev/null
+kill $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null
 ```
 
 ### 2. Record model config
